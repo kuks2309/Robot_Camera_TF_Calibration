@@ -12,7 +12,7 @@ thresholds:
 
 # Chessboard settings
 chessboard:
-  pattern_size: [11, 8]  # Inner corners (width, height)
+  pattern_size: [10, 7]  # Inner corners (width, height) - 11x8 squares
   square_size_mm: 22     # Size of each square in mm
 
 # Data storage

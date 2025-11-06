@@ -361,8 +361,8 @@ def process_calibration(session_dir: str, board_type: str):
     # Create detector based on board type
     if board_type.lower() == "chessboard":
         detector = ChessboardDetector(
-            pattern_size=(10, 7),
-            square_size=0.022
+            pattern_size=(10, 7),  # 11x8 squares = 10x7 internal corners
+            square_size=0.022      # 22mm
         )
         board_name = "Chessboard"
     else:  # charuco
