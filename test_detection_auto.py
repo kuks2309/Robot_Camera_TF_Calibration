@@ -53,12 +53,15 @@ def main():
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
-    pattern_size = tuple(config['chessboard']['pattern_size'])
+    # Get squares and convert to internal corners
+    squares = tuple(config['chessboard']['squares'])
+    pattern_size = (squares[0] - 1, squares[1] - 1)  # Internal corners = squares - 1
     square_size_mm = config['chessboard']['square_size_mm']
     images_dir = config['storage']['images_dir']
 
     print(f"\nConfiguration:")
-    print(f"  Pattern: {pattern_size[0]}x{pattern_size[1]} internal corners")
+    print(f"  Chessboard: {squares[0]}x{squares[1]} squares")
+    print(f"  Internal corners: {pattern_size[0]}x{pattern_size[1]}")
     print(f"  Square size: {square_size_mm}mm")
     print(f"  Images directory: {images_dir}")
 

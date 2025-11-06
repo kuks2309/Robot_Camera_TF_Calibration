@@ -358,13 +358,25 @@ def process_calibration(session_dir: str, board_type: str):
     tcp_poses, metadata, camera_intrinsics = load_session_data(session_dir)
     print(f"✅ Loaded {len(tcp_poses)} poses")
 
+    # Load config for board parameters
+    import yaml
+    import os as os_module
+    config_path = os_module.path.join(os_module.path.dirname(__file__), 'config.yaml')
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
     # Create detector based on board type
     if board_type.lower() == "chessboard":
+        # Get from config and convert squares to internal corners
+        squares = tuple(config['chessboard']['squares'])
+        pattern_size = (squares[0] - 1, squares[1] - 1)
+        square_size_m = config['chessboard']['square_size_mm'] / 1000.0
+
         detector = ChessboardDetector(
-            pattern_size=(10, 7),  # 11x8 squares = 10x7 internal corners
-            square_size=0.022      # 22mm
+            pattern_size=pattern_size,
+            square_size=square_size_m
         )
-        board_name = "Chessboard"
+        board_name = f"Chessboard ({squares[0]}x{squares[1]} squares)"
     else:  # charuco
         detector = ChArUcoBoardDetector(
             grid_size=(8, 6),

@@ -12,8 +12,13 @@ thresholds:
 
 # Chessboard settings
 chessboard:
-  pattern_size: [10, 7]  # Inner corners (width, height) - 11x8 squares
+  # Number of squares (NOT internal corners!)
+  # For example: 11x8 board has 11 squares wide, 8 squares tall
+  squares: [11, 8]       # Number of squares (width, height)
   square_size_mm: 22     # Size of each square in mm
+
+  # Internal corners will be calculated automatically as [squares[0]-1, squares[1]-1]
+  # 11x8 squares = 10x7 internal corners
 
 # Data storage
 storage:
