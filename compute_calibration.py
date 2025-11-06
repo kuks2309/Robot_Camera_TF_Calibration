@@ -32,8 +32,8 @@ class ChessboardDetector:
     """Detects standard chessboard pattern and estimates pose relative to camera."""
 
     def __init__(self,
-                 pattern_size: Tuple[int, int] = (9, 6),
-                 square_size: float = 0.025):  # 25mm squares
+                 pattern_size: Tuple[int, int] = (10, 7),
+                 square_size: float = 0.022):  # 22mm squares
         """
         Initialize Chessboard detector.
 
@@ -361,8 +361,8 @@ def process_calibration(session_dir: str, board_type: str):
     # Create detector based on board type
     if board_type.lower() == "chessboard":
         detector = ChessboardDetector(
-            pattern_size=(9, 6),
-            square_size=0.025
+            pattern_size=(10, 7),
+            square_size=0.022
         )
         board_name = "Chessboard"
     else:  # charuco
@@ -568,7 +568,7 @@ def main():
     # Select board type
     print("\nSelect calibration board type:")
     print("  1. ChArUco (8x6 grid) - Recommended")
-    print("  2. Chessboard (9x6 corners)")
+    print("  2. Chessboard (10x7 corners, 11x8 squares, 22mm)")
 
     while True:
         choice = input("\nEnter choice (1 or 2) [default: 1]: ").strip()
