@@ -139,20 +139,26 @@ def main():
 
             # Save image (full resolution, not resized)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            img_filename = os.path.join(images_dir, f"{timestamp}.jpg")
+
+            # Create base filename (without extension)
+            base_filename = f"image_{capture_count + 1:03d}"
+            img_filename = os.path.join(images_dir, f"{base_filename}.jpg")
+            yaml_filename = os.path.join(images_dir, f"{base_filename}.yaml")
+
             cv2.imwrite(img_filename, image, [cv2.IMWRITE_JPEG_QUALITY, 100])
 
             capture_count += 1
 
-            # Save data entry
-            data_entry = {
+            # Create data entry for individual YAML file
+            pose_data = {
                 'id': capture_count,
                 'timestamp': timestamp,
-                'image_file': img_filename,
+                'image_file': f"{base_filename}.jpg",
             }
 
             if tcp is not None:
-                data_entry['tcp_pose'] = {
+                x, y, z, rx, ry, rz = tcp
+                pose_data['tcp_pose'] = {
                     'x_mm': float(x),
                     'y_mm': float(y),
                     'z_mm': float(z),
@@ -161,14 +167,20 @@ def main():
                     'rz_deg': float(rz)
                 }
 
-            collected_data.append(data_entry)
+            # Save individual YAML file for this image
+            with open(yaml_filename, 'w') as f:
+                yaml.dump(pose_data, f, default_flow_style=False, sort_keys=False)
 
-            # Save data file immediately after each capture (incremental save)
+            # Also append to collected data list
+            collected_data.append(pose_data)
+
+            # Save combined data file immediately after each capture (incremental save)
             with open(data_file, 'w') as f:
                 yaml.dump(collected_data, f, default_flow_style=False, sort_keys=False)
 
             print(f"✅ Image saved: {img_filename}")
-            print(f"✅ Data saved: {data_file}")
+            print(f"✅ Pose saved: {yaml_filename}")
+            print(f"✅ Combined data saved: {data_file}")
             print(f"Total captured: {capture_count}")
 
     # Cleanup

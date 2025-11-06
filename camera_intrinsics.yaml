@@ -1,0 +1,23 @@
+# Camera Intrinsic Parameters
+# Calibrated using BoofCV
+
+camera_intrinsics:
+  width: 1920
+  height: 1080
+
+  # Focal lengths
+  fx: 1354.051415178241
+  fy: 1356.489778027527
+
+  # Principal point
+  ppx: 941.4939669195003
+  ppy: 556.3836265943218
+
+  # Distortion coefficients (radial: r0, r1, r2, tangential: t0, t1)
+  # OpenCV format: [k1, k2, p1, p2, k3]
+  coeffs: [0.100396219, -0.209910294, 0.0, 0.0, 0.0]
+
+  # Calibration info
+  model: "CameraPinholeRadial"
+  calibration_tool: "BoofCV"
+  skew: 0.0

@@ -285,17 +285,51 @@ class HandEyeCalibration:
                                    t_gripper2base: List[np.ndarray],
                                    R_target2cam: List[np.ndarray],
                                    t_target2cam: List[np.ndarray]) -> float:
-        """Compute average reprojection error for calibration validation."""
+        """
+        Compute average reprojection error for calibration validation.
+
+        For eye-in-hand calibration, we validate using consecutive pose pairs:
+        A_i * X = X * B_i
+
+        where:
+        - A_i = T_gripper2base[i] * inv(T_gripper2base[0]) (gripper motion from first pose)
+        - B_i = T_target2cam[i] * inv(T_target2cam[0]) (target motion from first pose)
+        - X = T_cam2gripper (what we computed)
+        """
+        if len(R_gripper2base) < 2:
+            return 0.0
+
         errors = []
 
-        for i in range(len(R_gripper2base)):
-            # Left side: T_gripper2base * T_cam2gripper
-            R_left = R_gripper2base[i] @ R_cam2gripper
-            t_left = R_gripper2base[i] @ t_cam2gripper + t_gripper2base[i]
+        # Use first pose as reference
+        R_gripper_ref = R_gripper2base[0]
+        t_gripper_ref = t_gripper2base[0]
+        R_target_ref = R_target2cam[0]
+        t_target_ref = t_target2cam[0]
 
-            # Right side: T_cam2gripper * T_target2cam
-            R_right = R_cam2gripper @ R_target2cam[i]
-            t_right = R_cam2gripper @ t_target2cam[i] + t_cam2gripper
+        # Compute inverse of reference poses
+        R_gripper_ref_inv = R_gripper_ref.T
+        t_gripper_ref_inv = -R_gripper_ref_inv @ t_gripper_ref
+
+        R_target_ref_inv = R_target_ref.T
+        t_target_ref_inv = -R_target_ref_inv @ t_target_ref
+
+        for i in range(1, len(R_gripper2base)):
+            # Compute A_i = T_gripper[i] * inv(T_gripper[0])
+            R_A = R_gripper2base[i] @ R_gripper_ref_inv
+            t_A = R_gripper2base[i] @ t_gripper_ref_inv + t_gripper2base[i]
+
+            # Compute B_i = T_target[i] * inv(T_target[0])
+            R_B = R_target2cam[i] @ R_target_ref_inv
+            t_B = R_target2cam[i] @ t_target_ref_inv + t_target2cam[i]
+
+            # Left side: A_i * X
+            R_left = R_A @ R_cam2gripper
+            t_left = R_A @ t_cam2gripper + t_A
+
+            # Right side: X * B_i
+            R_right = R_cam2gripper @ R_B
+            t_right = R_cam2gripper @ t_B + t_cam2gripper
 
             # Compute rotation error (angle between two rotations)
             R_error = R_left.T @ R_right
@@ -339,19 +373,21 @@ def load_session_data(session_dir: str) -> Tuple[List, Dict, Dict]:
     return tcp_poses, metadata, camera_intrinsics
 
 
-def process_calibration(session_dir: str, board_type: str):
+def process_calibration(session_dir: str, board_type: str, euler_order: str = 'xyz'):
     """
     Process calibration data and compute transformation matrix.
 
     Args:
         session_dir: Path to session directory
         board_type: "charuco" or "chessboard"
+        euler_order: Euler angle order ('xyz', 'zyx', 'XYZ', 'ZYX', etc.)
     """
     print("\n" + "="*80)
     print("Processing Calibration Data")
     print("="*80)
     print(f"Session: {session_dir}")
     print(f"Board type: {board_type}")
+    print(f"Euler angle order: {euler_order}")
 
     # Load session data
     print("\n📂 Loading session data...")
@@ -408,6 +444,9 @@ def process_calibration(session_dir: str, board_type: str):
 
     successful_detections = 0
 
+    # Debug: save detailed pose information
+    debug_poses = []
+
     for pose_data in tcp_poses:
         pose_id = pose_data['pose_id']
         img_path = os.path.join(session_dir, pose_data['image_relative_path'])
@@ -436,7 +475,8 @@ def process_calibration(session_dir: str, board_type: str):
         y_m = tcp['y_mm'] / 1000.0
         z_m = tcp['z_mm'] / 1000.0
 
-        R_tcp = R.from_euler('xyz', [tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']],
+        # Convert Euler angles to rotation matrix using specified order
+        R_tcp = R.from_euler(euler_order, [tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']],
                             degrees=True).as_matrix()
         t_tcp = np.array([[x_m], [y_m], [z_m]], dtype=np.float64)
 
@@ -450,8 +490,23 @@ def process_calibration(session_dir: str, board_type: str):
         R_target2cam.append(R_board)
         t_target2cam.append(t_board)
 
+        # Debug information
+        debug_poses.append({
+            'pose_id': pose_id,
+            'tcp_position_mm': [tcp['x_mm'], tcp['y_mm'], tcp['z_mm']],
+            'tcp_rotation_deg': [tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']],
+            'board_position_m': t_board.flatten().tolist(),
+            'board_distance_m': float(np.linalg.norm(t_board))
+        })
+
         successful_detections += 1
         print(f"✅ Pose {pose_id}: Board detected ({detection['num_corners']} features)")
+
+    # Save debug information
+    debug_file = os.path.join(session_dir, "debug_poses.json")
+    with open(debug_file, 'w') as f:
+        json.dump(debug_poses, f, indent=2)
+    print(f"\n🔍 Debug info saved to: {debug_file}")
 
     print(f"\n📊 Detection Summary:")
     print(f"   Total poses: {len(tcp_poses)}")
@@ -480,6 +535,7 @@ def process_calibration(session_dir: str, board_type: str):
         'timestamp': datetime.now().isoformat(),
         'session_dir': session_dir,
         'board_type': board_type,
+        'euler_order': euler_order,
         'num_poses_collected': len(tcp_poses),
         'num_poses_used': successful_detections,
         'calibration_method': calibrator.method_names[calibrator.calibration_type],
@@ -535,8 +591,159 @@ def main():
         print("   Please run collect_calibration_data.py first")
         return 1
 
-    # List available sessions
-    sessions = [d for d in os.listdir(calib_dir) if d.startswith("session_")]
+    # Check for direct YAML file or session directories
+    yaml_file = os.path.join(calib_dir, "calibration_data.yaml")
+    sessions = [d for d in os.listdir(calib_dir) if d.startswith("session_") and os.path.isdir(os.path.join(calib_dir, d))]
+
+    # Check for images directory with individual YAML files
+    images_dir = os.path.join(calib_dir, "images")
+    has_individual_yamls = False
+    if os.path.exists(images_dir):
+        yaml_files = [f for f in os.listdir(images_dir) if f.endswith('.yaml')]
+        if yaml_files:
+            has_individual_yamls = True
+
+    # If individual YAML files exist, convert them first
+    if has_individual_yamls and not sessions:
+        print(f"\n📂 Found individual YAML files in: {images_dir}")
+        print("Converting to session format...")
+
+        import yaml as yaml_module
+        import shutil
+
+        # Load all individual YAML files
+        yaml_data = []
+        for yaml_file_name in sorted([f for f in os.listdir(images_dir) if f.endswith('.yaml')]):
+            yaml_path = os.path.join(images_dir, yaml_file_name)
+            with open(yaml_path, 'r') as f:
+                data = yaml_module.safe_load(f)
+                if data:
+                    yaml_data.append(data)
+
+        if not yaml_data:
+            print(f"\n❌ No valid data in YAML files")
+            return 1
+
+        # Create session directory
+        from datetime import datetime
+        session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        session_dir = os.path.join(calib_dir, session_name)
+        os.makedirs(session_dir, exist_ok=True)
+        os.makedirs(os.path.join(session_dir, "images"), exist_ok=True)
+
+        print(f"Creating session: {session_dir}")
+
+        # Convert YAML data to JSON format
+        tcp_poses = []
+        for entry in yaml_data:
+            # Copy image
+            old_filename = entry['image_file']
+            old_path = os.path.join(images_dir, old_filename)
+            new_filename = f"pose_{entry['id']:03d}.jpg"
+            new_path = os.path.join(session_dir, "images", new_filename)
+
+            if os.path.exists(old_path):
+                shutil.copy2(old_path, new_path)
+            else:
+                print(f"⚠️  Image not found: {old_path}")
+                continue
+
+            tcp_poses.append({
+                'pose_id': entry['id'],
+                'timestamp': entry['timestamp'],
+                'tcp_pose': entry['tcp_pose'],
+                'image_file': new_path,
+                'image_relative_path': f"images/{new_filename}"
+            })
+
+        # Save tcp_poses.json
+        with open(os.path.join(session_dir, "tcp_poses.json"), 'w') as f:
+            json.dump(tcp_poses, f, indent=2)
+
+        # Save metadata.json
+        metadata = {
+            'timestamp': datetime.now().isoformat(),
+            'num_poses': len(tcp_poses),
+            'camera_intrinsics': {
+                'width': 1920, 'height': 1080,
+                'fx': 1380.0, 'fy': 1380.0,
+                'ppx': 960.0, 'ppy': 540.0,
+                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+            },
+            'tcp_source': 'robot_modbus',
+            'session_directory': session_dir
+        }
+        with open(os.path.join(session_dir, "metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"✅ Converted {len(tcp_poses)} poses from individual YAML files to session format\n")
+        sessions = [session_name]
+
+    # If combined YAML file exists, convert it
+    elif os.path.exists(yaml_file) and not sessions:
+        print(f"\n📂 Found: {yaml_file}")
+        print("Converting to session format...")
+
+        import yaml as yaml_module
+        with open(yaml_file, 'r') as f:
+            yaml_data = yaml_module.safe_load(f)
+
+        if not yaml_data:
+            print(f"\n❌ No data in {yaml_file}")
+            return 1
+
+        # Create session directory
+        from datetime import datetime
+        session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        session_dir = os.path.join(calib_dir, session_name)
+        os.makedirs(session_dir, exist_ok=True)
+        os.makedirs(os.path.join(session_dir, "images"), exist_ok=True)
+
+        print(f"Creating session: {session_dir}")
+
+        # Convert YAML data to JSON format
+        tcp_poses = []
+        for entry in yaml_data:
+            # Copy image
+            import shutil
+            old_path = entry['image_file']
+            new_filename = f"pose_{entry['id']:03d}.jpg"
+            new_path = os.path.join(session_dir, "images", new_filename)
+
+            if os.path.exists(old_path):
+                shutil.copy2(old_path, new_path)
+
+            tcp_poses.append({
+                'pose_id': entry['id'],
+                'timestamp': entry['timestamp'],
+                'tcp_pose': entry['tcp_pose'],
+                'image_file': new_path,
+                'image_relative_path': f"images/{new_filename}"
+            })
+
+        # Save tcp_poses.json
+        with open(os.path.join(session_dir, "tcp_poses.json"), 'w') as f:
+            json.dump(tcp_poses, f, indent=2)
+
+        # Save metadata.json
+        metadata = {
+            'timestamp': datetime.now().isoformat(),
+            'num_poses': len(tcp_poses),
+            'camera_intrinsics': {
+                'width': 1920, 'height': 1080,
+                'fx': 1380.0, 'fy': 1380.0,
+                'ppx': 960.0, 'ppy': 540.0,
+                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+            },
+            'tcp_source': 'robot_modbus',
+            'session_directory': session_dir
+        }
+        with open(os.path.join(session_dir, "metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"✅ Converted {len(tcp_poses)} poses to session format\n")
+        sessions = [session_name]
+
     if not sessions:
         print(f"\n❌ No calibration sessions found in {calib_dir}")
         print("   Please run collect_calibration_data.py first")
@@ -595,11 +802,37 @@ def main():
 
     print(f"✓ Selected: {board_type}")
 
+    # Select Euler angle order
+    print("\nSelect robot Euler angle order:")
+    print("  1. xyz (intrinsic) - Common for many robots")
+    print("  2. XYZ (extrinsic) - Alternative convention")
+    print("  3. zyx (intrinsic) - Roll-Pitch-Yaw")
+    print("  4. ZYX (extrinsic) - Roll-Pitch-Yaw extrinsic")
+
+    while True:
+        choice = input("\nEnter choice (1-4) [default: 1]: ").strip()
+        if choice == "" or choice == "1":
+            euler_order = "xyz"
+            break
+        elif choice == "2":
+            euler_order = "XYZ"
+            break
+        elif choice == "3":
+            euler_order = "zyx"
+            break
+        elif choice == "4":
+            euler_order = "ZYX"
+            break
+        else:
+            print("Invalid choice. Please enter 1-4.")
+
+    print(f"✓ Selected: {euler_order}")
+
     input("\nPress ENTER to start calibration computation...")
 
     # Process calibration
     try:
-        result = process_calibration(session_dir, board_type)
+        result = process_calibration(session_dir, board_type, euler_order)
 
         if result is None:
             return 1
