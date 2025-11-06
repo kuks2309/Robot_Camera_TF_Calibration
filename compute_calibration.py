@@ -132,8 +132,8 @@ class ChArUcoBoardDetector:
 
     def __init__(self,
                  grid_size: Tuple[int, int] = (8, 6),
-                 square_size: float = 0.0298,  # 30mm squares
-                 marker_size: float = 0.02091,  # 21mm markers
+                 square_size: float = 0.022,  # 22mm squares
+                 marker_size: float = 0.0154,  # 15.4mm markers (70% of 22mm)
                  aruco_dict: int = cv2.aruco.DICT_4X4_50):
         """Initialize ChArUco board detector."""
         self.grid_size = grid_size
@@ -368,8 +368,8 @@ def process_calibration(session_dir: str, board_type: str):
     else:  # charuco
         detector = ChArUcoBoardDetector(
             grid_size=(8, 6),
-            square_size=0.0298,
-            marker_size=0.02091
+            square_size=0.022,
+            marker_size=0.0154
         )
         board_name = "ChArUco"
 

@@ -1,0 +1,21 @@
+# Calibration Data Collection Configuration
+
+# Robot connection
+robot:
+  ip: "192.168.0.29"
+  port: 1502
+
+# Position stability thresholds
+thresholds:
+  position_mm: 0.5 # Maximum position difference in mm
+  rotation_deg: 0.1 # Maximum rotation difference in degrees
+
+# Chessboard settings
+chessboard:
+  pattern_size: [11, 8]  # Inner corners (width, height)
+  square_size_mm: 22     # Size of each square in mm
+
+# Data storage
+storage:
+  images_dir: "calibration_data/images"
+  data_file: "calibration_data/calibration_data.yaml"
