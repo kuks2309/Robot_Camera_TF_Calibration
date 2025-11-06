@@ -147,8 +147,14 @@ def main():
                 }
 
             collected_data.append(data_entry)
-            print(f"✅ Saved: {img_filename}")
-            print(f"Total: {capture_count}")
+
+            # Save data file immediately after each capture (incremental save)
+            with open(data_file, 'w') as f:
+                yaml.dump(collected_data, f, default_flow_style=False, sort_keys=False)
+
+            print(f"✅ Image saved: {img_filename}")
+            print(f"✅ Data saved: {data_file}")
+            print(f"Total captured: {capture_count}")
 
     # Cleanup
     cv2.destroyAllWindows()
@@ -156,13 +162,11 @@ def main():
     if robot is not None:
         robot.disconnect()
 
-    # Save collected data
+    # Final summary (data already saved incrementally)
     if len(collected_data) > 0:
-        with open(data_file, 'w') as f:
-            yaml.dump(collected_data, f, default_flow_style=False, sort_keys=False)
-        print(f"\n✅ Saved {len(collected_data)} captures to {data_file}")
+        print(f"\n✅ Total {len(collected_data)} captures saved to {data_file}")
     else:
-        print("\nNo data collected")
+        print("\n⚠️  No data collected")
 
     print("Done!")
 
