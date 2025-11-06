@@ -65,15 +65,30 @@ def main():
     print("  Q or ESC - Quit")
     print("\n" + "="*60 + "\n")
 
-    capture_count = 0
+    # Load existing data if file exists
     collected_data = []
+    if os.path.exists(data_file):
+        try:
+            with open(data_file, 'r') as f:
+                collected_data = yaml.safe_load(f) or []
+            print(f"📂 Loaded {len(collected_data)} existing captures from {data_file}")
+        except Exception as e:
+            print(f"⚠️  Could not load existing data: {e}")
+            collected_data = []
+
+    capture_count = len(collected_data)
 
     while True:
-        # Get frame
-        frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
+        # Get frame with error handling
+        try:
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
 
-        if not color_frame:
+            if not color_frame:
+                continue
+        except RuntimeError as e:
+            print(f"\n⚠️  Camera frame timeout: {e}")
+            print("Retrying...")
             continue
 
         # Convert to numpy
