@@ -1,875 +1,376 @@
 #!/usr/bin/env python3
 """
-Calibration Computation Script
+Hand-Eye Calibration with XYZ Extrinsic Euler angles (confirmed from manual page 344)
 
-This script processes collected calibration data to compute the camera-to-TCP
-transformation matrix using hand-eye calibration.
-
-Input:
-    calibration_data/session_YYYYMMDD_HHMMSS/
-    ├── tcp_poses.json
-    ├── images/pose_*.jpg
-    └── metadata.json
-
-Output:
-    (added to same directory)
-    ├── calibration_result.json
-    ├── camera_to_tcp_transform.npy
-    └── detected_poses/   # Images with board detection visualization
+Manual states: "Rx → Ry → Rz 순서로" (Rx → Ry → Rz order)
+This is XYZ extrinsic rotation order.
 """
 
 import cv2
 import numpy as np
-import sys
-import os
-from datetime import datetime
-from typing import Optional, List, Tuple, Dict
-import json
-from scipy.spatial.transform import Rotation as R
-
-
-class ChessboardDetector:
-    """Detects standard chessboard pattern and estimates pose relative to camera."""
-
-    def __init__(self,
-                 pattern_size: Tuple[int, int] = (10, 7),
-                 square_size: float = 0.022):  # 22mm squares
-        """
-        Initialize Chessboard detector.
-
-        Args:
-            pattern_size: (width, height) number of INTERNAL corners (not squares!)
-            square_size: Size of chessboard squares in meters
-        """
-        self.pattern_size = pattern_size
-        self.square_size = square_size
-
-        # Create 3D object points for the chessboard
-        self.objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
-        self.objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
-        self.objp *= square_size
-
-        # Termination criteria for corner refinement
-        self.criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-    def detect_and_estimate_pose(self,
-                                 image: np.ndarray,
-                                 camera_matrix: np.ndarray,
-                                 dist_coeffs: np.ndarray) -> Optional[Dict]:
-        """Detect chessboard and estimate its pose."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Find chessboard corners
-        ret, corners = cv2.findChessboardCorners(gray, self.pattern_size, None)
-
-        if not ret:
-            return None
-
-        # Refine corner locations to sub-pixel accuracy
-        corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), self.criteria)
-
-        # Estimate pose
-        success, rvec, tvec = cv2.solvePnP(
-            self.objp,
-            corners_refined,
-            camera_matrix,
-            dist_coeffs
-        )
-
-        if not success:
-            return None
-
-        # Convert rotation vector to rotation matrix
-        rotation_matrix, _ = cv2.Rodrigues(rvec)
-
-        # Calculate camera pose in board frame (inverse transformation)
-        camera_rotation_in_board = rotation_matrix.T
-        camera_position_in_board = -camera_rotation_in_board @ tvec
-
-        return {
-            'corners': corners_refined,
-            'rvec': rvec,
-            'tvec': tvec,
-            'rotation_matrix': rotation_matrix,
-            'board_position_in_camera': tvec,
-            'camera_position_in_board': camera_position_in_board,
-            'camera_rotation_in_board': camera_rotation_in_board,
-            'num_corners': len(corners_refined)
-        }
-
-    def draw_detection(self,
-                      image: np.ndarray,
-                      detection_result: Dict,
-                      camera_matrix: np.ndarray,
-                      dist_coeffs: np.ndarray) -> np.ndarray:
-        """Draw detected board and coordinate frame on image."""
-        img_copy = image.copy()
-
-        # Draw detected corners
-        cv2.drawChessboardCorners(img_copy, self.pattern_size,
-                                 detection_result['corners'], True)
-
-        # Draw coordinate frame
-        cv2.drawFrameAxes(
-            img_copy,
-            camera_matrix,
-            dist_coeffs,
-            detection_result['rvec'],
-            detection_result['tvec'],
-            0.1  # Axis length in meters
-        )
-
-        # Add text info
-        num_corners = detection_result['num_corners']
-        cv2.putText(img_copy, f"Corners: {num_corners}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        return img_copy
-
-
-class ChArUcoBoardDetector:
-    """Detects ChArUco board and estimates pose relative to camera."""
-
-    def __init__(self,
-                 grid_size: Tuple[int, int] = (8, 6),
-                 square_size: float = 0.022,  # 22mm squares
-                 marker_size: float = 0.0154,  # 15.4mm markers (70% of 22mm)
-                 aruco_dict: int = cv2.aruco.DICT_4X4_50):
-        """Initialize ChArUco board detector."""
-        self.grid_size = grid_size
-        self.square_size = square_size
-        self.marker_size = marker_size
-
-        # Create ArUco dictionary and board
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict)
-        self.aruco_params = cv2.aruco.DetectorParameters()
-        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
-
-        self.board = cv2.aruco.CharucoBoard(
-            grid_size,
-            square_size,
-            marker_size,
-            self.aruco_dict
-        )
-
-        self.charuco_detector = cv2.aruco.CharucoDetector(self.board)
-
-    def detect_and_estimate_pose(self,
-                                 image: np.ndarray,
-                                 camera_matrix: np.ndarray,
-                                 dist_coeffs: np.ndarray) -> Optional[Dict]:
-        """Detect ChArUco board and estimate its pose."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Detect ChArUco board
-        charuco_corners, charuco_ids, marker_corners, marker_ids = \
-            self.charuco_detector.detectBoard(gray)
-
-        if charuco_corners is None or len(charuco_corners) < 4:
-            return None
-
-        # Estimate pose
-        success, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            charuco_corners,
-            charuco_ids,
-            self.board,
-            camera_matrix,
-            dist_coeffs,
-            None,
-            None
-        )
-
-        if not success:
-            return None
-
-        # Convert rotation vector to rotation matrix
-        rotation_matrix, _ = cv2.Rodrigues(rvec)
-
-        # Calculate camera pose in board frame (inverse transformation)
-        camera_rotation_in_board = rotation_matrix.T
-        camera_position_in_board = -camera_rotation_in_board @ tvec
-
-        return {
-            'charuco_corners': charuco_corners,
-            'charuco_ids': charuco_ids,
-            'marker_corners': marker_corners,
-            'marker_ids': marker_ids,
-            'rvec': rvec,
-            'tvec': tvec,
-            'rotation_matrix': rotation_matrix,
-            'board_position_in_camera': tvec,
-            'camera_position_in_board': camera_position_in_board,
-            'camera_rotation_in_board': camera_rotation_in_board,
-            'num_corners': len(charuco_corners)
-        }
-
-    def draw_detection(self,
-                      image: np.ndarray,
-                      detection_result: Dict,
-                      camera_matrix: np.ndarray,
-                      dist_coeffs: np.ndarray) -> np.ndarray:
-        """Draw detected board and coordinate frame on image."""
-        img_copy = image.copy()
-
-        # Draw detected ChArUco corners
-        if detection_result['charuco_corners'] is not None:
-            cv2.aruco.drawDetectedCornersCharuco(
-                img_copy,
-                detection_result['charuco_corners'],
-                detection_result['charuco_ids']
-            )
-
-        # Draw ArUco markers
-        if detection_result['marker_corners'] is not None:
-            cv2.aruco.drawDetectedMarkers(
-                img_copy,
-                detection_result['marker_corners'],
-                detection_result['marker_ids']
-            )
-
-        # Draw coordinate frame
-        cv2.drawFrameAxes(
-            img_copy,
-            camera_matrix,
-            dist_coeffs,
-            detection_result['rvec'],
-            detection_result['tvec'],
-            0.1  # Axis length in meters
-        )
-
-        # Add text info
-        num_corners = detection_result['num_corners']
-        cv2.putText(img_copy, f"Corners: {num_corners}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        return img_copy
-
-
-class HandEyeCalibration:
-    """Performs hand-eye calibration using collected data."""
-
-    def __init__(self, calibration_type: int = cv2.CALIB_HAND_EYE_TSAI):
-        """Initialize hand-eye calibration solver."""
-        self.calibration_type = calibration_type
-        self.method_names = {
-            cv2.CALIB_HAND_EYE_TSAI: "Tsai",
-            cv2.CALIB_HAND_EYE_PARK: "Park",
-            cv2.CALIB_HAND_EYE_HORAUD: "Horaud",
-            cv2.CALIB_HAND_EYE_ANDREFF: "Andreff",
-            cv2.CALIB_HAND_EYE_DANIILIDIS: "Daniilidis"
-        }
-
-    def compute_calibration(self,
-                           R_gripper2base: List[np.ndarray],
-                           t_gripper2base: List[np.ndarray],
-                           R_target2cam: List[np.ndarray],
-                           t_target2cam: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute hand-eye calibration (eye-in-hand)."""
-        print(f"\n🔧 Computing hand-eye calibration using {self.method_names[self.calibration_type]} method...")
-        print(f"   Number of poses: {len(R_gripper2base)}")
-
-        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-            R_gripper2base=R_gripper2base,
-            t_gripper2base=t_gripper2base,
-            R_target2cam=R_target2cam,
-            t_target2cam=t_target2cam,
-            method=self.calibration_type
-        )
-
-        return R_cam2gripper, t_cam2gripper
-
-    @staticmethod
-    def compute_reprojection_error(R_cam2gripper: np.ndarray,
-                                   t_cam2gripper: np.ndarray,
-                                   R_gripper2base: List[np.ndarray],
-                                   t_gripper2base: List[np.ndarray],
-                                   R_target2cam: List[np.ndarray],
-                                   t_target2cam: List[np.ndarray]) -> float:
-        """
-        Compute average reprojection error for calibration validation.
-
-        For eye-in-hand calibration, we validate using consecutive pose pairs:
-        A_i * X = X * B_i
-
-        where:
-        - A_i = T_gripper2base[i] * inv(T_gripper2base[0]) (gripper motion from first pose)
-        - B_i = T_target2cam[i] * inv(T_target2cam[0]) (target motion from first pose)
-        - X = T_cam2gripper (what we computed)
-        """
-        if len(R_gripper2base) < 2:
-            return 0.0
-
-        errors = []
-
-        # Use first pose as reference
-        R_gripper_ref = R_gripper2base[0]
-        t_gripper_ref = t_gripper2base[0]
-        R_target_ref = R_target2cam[0]
-        t_target_ref = t_target2cam[0]
-
-        # Compute inverse of reference poses
-        R_gripper_ref_inv = R_gripper_ref.T
-        t_gripper_ref_inv = -R_gripper_ref_inv @ t_gripper_ref
-
-        R_target_ref_inv = R_target_ref.T
-        t_target_ref_inv = -R_target_ref_inv @ t_target_ref
-
-        for i in range(1, len(R_gripper2base)):
-            # Compute A_i = T_gripper[i] * inv(T_gripper[0])
-            R_A = R_gripper2base[i] @ R_gripper_ref_inv
-            t_A = R_gripper2base[i] @ t_gripper_ref_inv + t_gripper2base[i]
-
-            # Compute B_i = T_target[i] * inv(T_target[0])
-            R_B = R_target2cam[i] @ R_target_ref_inv
-            t_B = R_target2cam[i] @ t_target_ref_inv + t_target2cam[i]
-
-            # Left side: A_i * X
-            R_left = R_A @ R_cam2gripper
-            t_left = R_A @ t_cam2gripper + t_A
-
-            # Right side: X * B_i
-            R_right = R_cam2gripper @ R_B
-            t_right = R_cam2gripper @ t_B + t_cam2gripper
-
-            # Compute rotation error (angle between two rotations)
-            R_error = R_left.T @ R_right
-            angle_error = np.arccos(np.clip((np.trace(R_error) - 1) / 2, -1, 1))
-            angle_error_deg = np.degrees(angle_error)
-
-            # Compute translation error
-            t_error = np.linalg.norm(t_left - t_right)
-
-            errors.append((angle_error_deg, t_error))
-
-        avg_rot_error = np.mean([e[0] for e in errors])
-        avg_trans_error = np.mean([e[1] for e in errors])
-
-        print(f"\n📊 Calibration Validation:")
-        print(f"   Average rotation error: {avg_rot_error:.4f} degrees")
-        print(f"   Average translation error: {avg_trans_error*1000:.4f} mm")
-
-        return avg_rot_error
-
-
-def load_session_data(session_dir: str) -> Tuple[List, Dict, Dict]:
+import yaml
+import glob
+from pathlib import Path
+from scipy.spatial.transform import Rotation
+
+
+def load_camera_intrinsics(yaml_path):
+    """Load camera intrinsic parameters"""
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    cam = data['camera_intrinsics']
+    camera_matrix = np.array([
+        [cam['fx'], 0, cam['ppx']],
+        [0, cam['fy'], cam['ppy']],
+        [0, 0, 1]
+    ], dtype=np.float64)
+    dist_coeffs = np.array(cam['coeffs'], dtype=np.float64)
+
+    return camera_matrix, dist_coeffs
+
+
+def load_chessboard_config(yaml_path):
+    """Load chessboard configuration"""
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    config = data['chessboard']
+    squares = config['squares']
+    square_size_mm = config['square_size_mm']
+    pattern_size = (squares[0] - 1, squares[1] - 1)
+
+    return pattern_size, square_size_mm
+
+
+def create_chessboard_object_points(pattern_size, square_size_mm):
+    """Create 3D object points for chessboard"""
+    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
+    objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
+    objp *= square_size_mm
+    return objp
+
+
+def detect_chessboard_pose(image_path, camera_matrix, dist_coeffs, pattern_size, objp):
+    """Detect chessboard and get camera-to-board transformation"""
+    img = cv2.imread(image_path)
+    if img is None:
+        return False, None, None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ret, corners = cv2.findChessboardCorners(gray, pattern_size, None)
+
+    if not ret:
+        return False, None, None
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+    success, rvec, tvec = cv2.solvePnP(objp, corners_refined, camera_matrix,
+                                        dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+
+    return success, rvec, tvec
+
+
+def euler_to_rotation_matrix_intrinsic_xyz(rx_deg, ry_deg, rz_deg):
     """
-    Load collected data from session directory.
+    Convert Euler angles to rotation matrix using INTRINSIC xyz rotation
+    As confirmed in manual page 344: Rx → Ry → Rz 순서 (Tool 좌표계 기준)
 
-    Returns:
-        Tuple of (tcp_poses, metadata, camera_intrinsics)
-    """
-    # Load TCP poses
-    poses_file = os.path.join(session_dir, "tcp_poses.json")
-    with open(poses_file, 'r') as f:
-        tcp_poses = json.load(f)
-
-    # Load metadata
-    metadata_file = os.path.join(session_dir, "metadata.json")
-    with open(metadata_file, 'r') as f:
-        metadata = json.load(f)
-
-    camera_intrinsics = metadata['camera_intrinsics']
-
-    return tcp_poses, metadata, camera_intrinsics
-
-
-def process_calibration(session_dir: str, board_type: str, euler_order: str = 'xyz'):
-    """
-    Process calibration data and compute transformation matrix.
+    Tool 좌표계는 움직이는 좌표계이므로 intrinsic rotation입니다.
 
     Args:
-        session_dir: Path to session directory
-        board_type: "charuco" or "chessboard"
-        euler_order: Euler angle order ('xyz', 'zyx', 'XYZ', 'ZYX', etc.)
+        rx_deg, ry_deg, rz_deg: Euler angles in degrees
+
+    Returns:
+        3x3 rotation matrix
     """
-    print("\n" + "="*80)
-    print("Processing Calibration Data")
-    print("="*80)
-    print(f"Session: {session_dir}")
-    print(f"Board type: {board_type}")
-    print(f"Euler angle order: {euler_order}")
+    r = Rotation.from_euler('xyz', [rx_deg, ry_deg, rz_deg], degrees=True)
+    return r.as_matrix()
 
-    # Load session data
-    print("\n📂 Loading session data...")
-    tcp_poses, metadata, camera_intrinsics = load_session_data(session_dir)
-    print(f"✅ Loaded {len(tcp_poses)} poses")
 
-    # Load config for board parameters
-    import yaml
-    import os as os_module
-    config_path = os_module.path.join(os_module.path.dirname(__file__), 'config.yaml')
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+def load_calibration_data(images_dir, camera_matrix, dist_coeffs, pattern_size, objp):
+    """Load all calibration data with xyz intrinsic rotation"""
+    data_list = []
+    yaml_files = sorted(glob.glob(str(images_dir / "*.yaml")))
 
-    # Create detector based on board type
-    if board_type.lower() == "chessboard":
-        # Get from config and convert squares to internal corners
-        squares = tuple(config['chessboard']['squares'])
-        pattern_size = (squares[0] - 1, squares[1] - 1)
-        square_size_m = config['chessboard']['square_size_mm'] / 1000.0
+    print(f"\nLoading calibration data...")
+    for yaml_file in yaml_files:
+        yaml_path = Path(yaml_file)
 
-        detector = ChessboardDetector(
-            pattern_size=pattern_size,
-            square_size=square_size_m
-        )
-        board_name = f"Chessboard ({squares[0]}x{squares[1]} squares)"
-    else:  # charuco
-        detector = ChArUcoBoardDetector(
-            grid_size=(8, 6),
-            square_size=0.022,
-            marker_size=0.0154
-        )
-        board_name = "ChArUco"
+        with open(yaml_path, 'r') as f:
+            yaml_data = yaml.safe_load(f)
 
-    print(f"🎯 Using {board_name} detector")
-
-    # Build camera matrix and distortion coefficients
-    camera_matrix = np.array([
-        [camera_intrinsics['fx'], 0, camera_intrinsics['ppx']],
-        [0, camera_intrinsics['fy'], camera_intrinsics['ppy']],
-        [0, 0, 1]
-    ], dtype=np.float32)
-
-    dist_coeffs = np.array(camera_intrinsics['coeffs'], dtype=np.float32)
-
-    # Process each image
-    print(f"\n🔍 Detecting {board_name} in images...")
-    R_gripper2base = []
-    t_gripper2base = []
-    R_target2cam = []
-    t_target2cam = []
-
-    detected_poses_dir = os.path.join(session_dir, "detected_poses")
-    os.makedirs(detected_poses_dir, exist_ok=True)
-
-    successful_detections = 0
-
-    # Debug: save detailed pose information
-    debug_poses = []
-
-    for pose_data in tcp_poses:
-        pose_id = pose_data['pose_id']
-        img_path = os.path.join(session_dir, pose_data['image_relative_path'])
-
-        # Load image
-        image = cv2.imread(img_path)
-        if image is None:
-            print(f"⚠️  Pose {pose_id}: Failed to load image {img_path}")
+        if 'tcp_pose' not in yaml_data:
             continue
 
-        # Detect board
-        detection = detector.detect_and_estimate_pose(image, camera_matrix, dist_coeffs)
+        tcp = yaml_data['tcp_pose']
+        image_file = yaml_data.get('image_file', yaml_path.stem + '.jpg')
+        image_path = images_dir / image_file
 
-        if detection is None:
-            print(f"❌ Pose {pose_id}: Board not detected")
+        success, rvec, tvec = detect_chessboard_pose(
+            str(image_path), camera_matrix, dist_coeffs, pattern_size, objp
+        )
+
+        if not success:
+            print(f"  Skipped {image_file}: chessboard not detected")
             continue
 
-        # Save visualization
-        img_with_detection = detector.draw_detection(image, detection, camera_matrix, dist_coeffs)
-        detection_img_path = os.path.join(detected_poses_dir, f"detected_pose_{pose_id:03d}.jpg")
-        cv2.imwrite(detection_img_path, img_with_detection)
+        # Convert TCP Euler angles to rotation matrix (INTRINSIC xyz)
+        R_tcp = euler_to_rotation_matrix_intrinsic_xyz(
+            tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']
+        )
+        t_tcp = np.array([[tcp['x_mm']], [tcp['y_mm']], [tcp['z_mm']]], dtype=np.float64)
 
-        # Extract TCP pose
-        tcp = pose_data['tcp_pose']
-        x_m = tcp['x_mm'] / 1000.0
-        y_m = tcp['y_mm'] / 1000.0
-        z_m = tcp['z_mm'] / 1000.0
+        # Convert board pose to rotation matrix
+        R_board, _ = cv2.Rodrigues(rvec)
+        t_board = tvec.astype(np.float64)
 
-        # Convert Euler angles to rotation matrix using specified order
-        R_tcp = R.from_euler(euler_order, [tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']],
-                            degrees=True).as_matrix()
-        t_tcp = np.array([[x_m], [y_m], [z_m]], dtype=np.float64)
-
-        R_gripper2base.append(R_tcp)
-        t_gripper2base.append(t_tcp)
-
-        # Extract board pose
-        R_board = detection['rotation_matrix'].astype(np.float64)
-        t_board = detection['tvec'].reshape(3, 1).astype(np.float64)
-
-        R_target2cam.append(R_board)
-        t_target2cam.append(t_board)
-
-        # Debug information
-        debug_poses.append({
-            'pose_id': pose_id,
-            'tcp_position_mm': [tcp['x_mm'], tcp['y_mm'], tcp['z_mm']],
-            'tcp_rotation_deg': [tcp['rx_deg'], tcp['ry_deg'], tcp['rz_deg']],
-            'board_position_m': t_board.flatten().tolist(),
-            'board_distance_m': float(np.linalg.norm(t_board))
+        data_list.append({
+            'id': yaml_data.get('id'),
+            'R_gripper2base': R_tcp,
+            't_gripper2base': t_tcp,
+            'R_target2cam': R_board,
+            't_target2cam': t_board
         })
+        print(f"  Loaded {image_file}")
 
-        successful_detections += 1
-        print(f"✅ Pose {pose_id}: Board detected ({detection['num_corners']} features)")
+    return data_list
 
-    # Save debug information
-    debug_file = os.path.join(session_dir, "debug_poses.json")
-    with open(debug_file, 'w') as f:
-        json.dump(debug_poses, f, indent=2)
-    print(f"\n🔍 Debug info saved to: {debug_file}")
 
-    print(f"\n📊 Detection Summary:")
-    print(f"   Total poses: {len(tcp_poses)}")
-    print(f"   Successful detections: {successful_detections}")
-    print(f"   Failed detections: {len(tcp_poses) - successful_detections}")
+def perform_hand_eye_calibration(data_list):
+    """Perform hand-eye calibration with all methods"""
 
-    if successful_detections < 3:
-        print(f"\n❌ Insufficient successful detections (need at least 3, have {successful_detections})")
-        print("   Please collect more data or check calibration board visibility")
-        return None
-
-    # Compute hand-eye calibration
-    calibrator = HandEyeCalibration()
-    R_cam2gripper, t_cam2gripper = calibrator.compute_calibration(
-        R_gripper2base, t_gripper2base, R_target2cam, t_target2cam
-    )
-
-    # Compute validation error
-    avg_error = calibrator.compute_reprojection_error(
-        R_cam2gripper, t_cam2gripper,
-        R_gripper2base, t_gripper2base, R_target2cam, t_target2cam
-    )
-
-    # Build calibration result
-    calibration_result = {
-        'timestamp': datetime.now().isoformat(),
-        'session_dir': session_dir,
-        'board_type': board_type,
-        'euler_order': euler_order,
-        'num_poses_collected': len(tcp_poses),
-        'num_poses_used': successful_detections,
-        'calibration_method': calibrator.method_names[calibrator.calibration_type],
-        'R_cam2gripper': R_cam2gripper.tolist(),
-        't_cam2gripper': t_cam2gripper.tolist(),
-        'avg_rotation_error_deg': float(avg_error),
-        'camera_to_tcp_transformation': {
-            'rotation_matrix': R_cam2gripper.tolist(),
-            'translation_vector_m': t_cam2gripper.flatten().tolist(),
-            'euler_angles_deg': R.from_matrix(R_cam2gripper).as_euler('xyz', degrees=True).tolist()
-        }
+    methods = {
+        'Tsai': cv2.CALIB_HAND_EYE_TSAI,
+        'Park': cv2.CALIB_HAND_EYE_PARK,
+        'Horaud': cv2.CALIB_HAND_EYE_HORAUD,
+        'Andreff': cv2.CALIB_HAND_EYE_ANDREFF,
+        'Daniilidis': cv2.CALIB_HAND_EYE_DANIILIDIS
     }
 
-    print("\n✅ Calibration computed successfully")
-    print(f"\n📊 Camera-to-TCP Transformation:")
-    print(f"   Translation (m): {t_cam2gripper.flatten()}")
-    print(f"   Euler angles (deg): {calibration_result['camera_to_tcp_transformation']['euler_angles_deg']}")
-    print(f"   Average error: {avg_error:.4f} degrees")
+    R_gripper2base = [d['R_gripper2base'] for d in data_list]
+    t_gripper2base = [d['t_gripper2base'] for d in data_list]
+    R_target2cam = [d['R_target2cam'] for d in data_list]
+    t_target2cam = [d['t_target2cam'] for d in data_list]
 
-    # Save results
-    print(f"\n💾 Saving calibration results...")
+    results = {}
 
-    # Save JSON result
-    result_file = os.path.join(session_dir, "calibration_result.json")
-    with open(result_file, 'w') as f:
-        json.dump(calibration_result, f, indent=2)
-    print(f"   Saved: {result_file}")
+    print(f"\nPerforming hand-eye calibration with {len(data_list)} poses...")
+    for method_name, method_code in methods.items():
+        try:
+            R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+                R_gripper2base, t_gripper2base,
+                R_target2cam, t_target2cam,
+                method=method_code
+            )
 
-    # Save transformation matrix in numpy format
+            # Compute error
+            error = compute_reprojection_error(
+                R_cam2gripper, t_cam2gripper,
+                data_list
+            )
+
+            results[method_name] = {
+                'R_cam2gripper': R_cam2gripper,
+                't_cam2gripper': t_cam2gripper,
+                'error': error
+            }
+
+        except Exception as e:
+            print(f"  {method_name} failed: {e}")
+            results[method_name] = None
+
+    return results
+
+
+def compute_reprojection_error(R_cam2gripper, t_cam2gripper, data_list):
+    """
+    Compute reprojection error
+
+    For eye-in-hand: T_gripper2base * T_cam2gripper * T_target2cam = T_target2base (constant)
+    """
     T_cam2gripper = np.eye(4)
     T_cam2gripper[:3, :3] = R_cam2gripper
     T_cam2gripper[:3, 3:4] = t_cam2gripper
 
-    transform_file = os.path.join(session_dir, "camera_to_tcp_transform.npy")
-    np.save(transform_file, T_cam2gripper)
-    print(f"   Saved: {transform_file}")
+    # Compute board position in base frame for each pose
+    board_in_base = []
 
-    print(f"\n📁 All results saved to: {session_dir}")
+    for data in data_list:
+        T_gripper2base = np.eye(4)
+        T_gripper2base[:3, :3] = data['R_gripper2base']
+        T_gripper2base[:3, 3:4] = data['t_gripper2base']
 
-    return calibration_result
+        T_target2cam = np.eye(4)
+        T_target2cam[:3, :3] = data['R_target2cam']
+        T_target2cam[:3, 3:4] = data['t_target2cam']
+
+        # Board position in base frame
+        T_target2base = T_gripper2base @ T_cam2gripper @ T_target2cam
+        board_in_base.append(T_target2base[:3, 3])
+
+    board_in_base = np.array(board_in_base)
+
+    # Board should be at same position for all poses
+    mean_board = np.mean(board_in_base, axis=0)
+    deviations = board_in_base - mean_board
+    errors = np.linalg.norm(deviations, axis=1)
+
+    return {
+        'mean_error': np.mean(errors),
+        'std_error': np.std(errors),
+        'max_error': np.max(errors),
+        'rms_error': np.sqrt(np.mean(errors**2)),
+        'board_positions': board_in_base,
+        'mean_position': mean_board
+    }
+
+
+def rotation_matrix_to_euler_xyz(R):
+    """Convert rotation matrix to xyz intrinsic Euler angles"""
+    r = Rotation.from_matrix(R)
+    return r.as_euler('xyz', degrees=True)
 
 
 def main():
-    """Main calibration computation workflow."""
-    print("\n" + "="*80)
-    print("Robot-Camera Hand-Eye Calibration - Computation")
-    print("="*80)
+    base_dir = Path(__file__).parent
+    intrinsics_path = base_dir / "camera_intrinsics.yaml"
+    config_path = base_dir / "config.yaml"
+    images_dir = base_dir / "calibration_data" / "images"
+    output_dir = images_dir
 
-    # Find calibration data directory
-    calib_dir = "calibration_data"
-    if not os.path.exists(calib_dir):
-        print(f"\n❌ Calibration data directory not found: {calib_dir}")
-        print("   Please run collect_calibration_data.py first")
-        return 1
+    print("="*60)
+    print("Hand-Eye Calibration (xyz Intrinsic - Manual Page 344)")
+    print("="*60)
+    print("\nManual confirms: Rx → Ry → Rz rotation order (Tool 좌표계 기준)")
+    print("This corresponds to xyz intrinsic rotation")
 
-    # Check for direct YAML file or session directories
-    yaml_file = os.path.join(calib_dir, "calibration_data.yaml")
-    sessions = [d for d in os.listdir(calib_dir) if d.startswith("session_") and os.path.isdir(os.path.join(calib_dir, d))]
+    # Load parameters
+    print("\nLoading parameters...")
+    camera_matrix, dist_coeffs = load_camera_intrinsics(intrinsics_path)
+    pattern_size, square_size_mm = load_chessboard_config(config_path)
+    objp = create_chessboard_object_points(pattern_size, square_size_mm)
 
-    # Check for images directory with individual YAML files
-    images_dir = os.path.join(calib_dir, "images")
-    has_individual_yamls = False
-    if os.path.exists(images_dir):
-        yaml_files = [f for f in os.listdir(images_dir) if f.endswith('.yaml')]
-        if yaml_files:
-            has_individual_yamls = True
+    # Load data with XYZ extrinsic rotation
+    data_list = load_calibration_data(
+        images_dir, camera_matrix, dist_coeffs, pattern_size, objp
+    )
+    print(f"\nTotal valid poses loaded: {len(data_list)}")
 
-    # If individual YAML files exist, convert them first
-    if has_individual_yamls and not sessions:
-        print(f"\n📂 Found individual YAML files in: {images_dir}")
-        print("Converting to session format...")
+    if len(data_list) < 3:
+        print("\nERROR: Not enough poses for calibration (minimum 3 required)")
+        return
 
-        import yaml as yaml_module
-        import shutil
+    # Try all calibration methods
+    results = perform_hand_eye_calibration(data_list)
 
-        # Load all individual YAML files
-        yaml_data = []
-        for yaml_file_name in sorted([f for f in os.listdir(images_dir) if f.endswith('.yaml')]):
-            yaml_path = os.path.join(images_dir, yaml_file_name)
-            with open(yaml_path, 'r') as f:
-                data = yaml_module.safe_load(f)
-                if data:
-                    yaml_data.append(data)
+    # Find best result
+    print(f"\n{'='*60}")
+    print("Results Summary")
+    print(f"{'='*60}\n")
 
-        if not yaml_data:
-            print(f"\n❌ No valid data in YAML files")
-            return 1
+    best_method = None
+    best_error = float('inf')
+    best_result = None
 
-        # Create session directory
-        from datetime import datetime
-        session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        session_dir = os.path.join(calib_dir, session_name)
-        os.makedirs(session_dir, exist_ok=True)
-        os.makedirs(os.path.join(session_dir, "images"), exist_ok=True)
-
-        print(f"Creating session: {session_dir}")
-
-        # Convert YAML data to JSON format
-        tcp_poses = []
-        for entry in yaml_data:
-            # Copy image
-            old_filename = entry['image_file']
-            old_path = os.path.join(images_dir, old_filename)
-            new_filename = f"pose_{entry['id']:03d}.jpg"
-            new_path = os.path.join(session_dir, "images", new_filename)
-
-            if os.path.exists(old_path):
-                shutil.copy2(old_path, new_path)
-            else:
-                print(f"⚠️  Image not found: {old_path}")
-                continue
-
-            tcp_poses.append({
-                'pose_id': entry['id'],
-                'timestamp': entry['timestamp'],
-                'tcp_pose': entry['tcp_pose'],
-                'image_file': new_path,
-                'image_relative_path': f"images/{new_filename}"
-            })
-
-        # Save tcp_poses.json
-        with open(os.path.join(session_dir, "tcp_poses.json"), 'w') as f:
-            json.dump(tcp_poses, f, indent=2)
-
-        # Save metadata.json
-        metadata = {
-            'timestamp': datetime.now().isoformat(),
-            'num_poses': len(tcp_poses),
-            'camera_intrinsics': {
-                'width': 1920, 'height': 1080,
-                'fx': 1380.0, 'fy': 1380.0,
-                'ppx': 960.0, 'ppy': 540.0,
-                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            'tcp_source': 'robot_modbus',
-            'session_directory': session_dir
-        }
-        with open(os.path.join(session_dir, "metadata.json"), 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        print(f"✅ Converted {len(tcp_poses)} poses from individual YAML files to session format\n")
-        sessions = [session_name]
-
-    # If combined YAML file exists, convert it
-    elif os.path.exists(yaml_file) and not sessions:
-        print(f"\n📂 Found: {yaml_file}")
-        print("Converting to session format...")
-
-        import yaml as yaml_module
-        with open(yaml_file, 'r') as f:
-            yaml_data = yaml_module.safe_load(f)
-
-        if not yaml_data:
-            print(f"\n❌ No data in {yaml_file}")
-            return 1
-
-        # Create session directory
-        from datetime import datetime
-        session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        session_dir = os.path.join(calib_dir, session_name)
-        os.makedirs(session_dir, exist_ok=True)
-        os.makedirs(os.path.join(session_dir, "images"), exist_ok=True)
-
-        print(f"Creating session: {session_dir}")
-
-        # Convert YAML data to JSON format
-        tcp_poses = []
-        for entry in yaml_data:
-            # Copy image
-            import shutil
-            old_path = entry['image_file']
-            new_filename = f"pose_{entry['id']:03d}.jpg"
-            new_path = os.path.join(session_dir, "images", new_filename)
-
-            if os.path.exists(old_path):
-                shutil.copy2(old_path, new_path)
-
-            tcp_poses.append({
-                'pose_id': entry['id'],
-                'timestamp': entry['timestamp'],
-                'tcp_pose': entry['tcp_pose'],
-                'image_file': new_path,
-                'image_relative_path': f"images/{new_filename}"
-            })
-
-        # Save tcp_poses.json
-        with open(os.path.join(session_dir, "tcp_poses.json"), 'w') as f:
-            json.dump(tcp_poses, f, indent=2)
-
-        # Save metadata.json
-        metadata = {
-            'timestamp': datetime.now().isoformat(),
-            'num_poses': len(tcp_poses),
-            'camera_intrinsics': {
-                'width': 1920, 'height': 1080,
-                'fx': 1380.0, 'fy': 1380.0,
-                'ppx': 960.0, 'ppy': 540.0,
-                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
-            },
-            'tcp_source': 'robot_modbus',
-            'session_directory': session_dir
-        }
-        with open(os.path.join(session_dir, "metadata.json"), 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        print(f"✅ Converted {len(tcp_poses)} poses to session format\n")
-        sessions = [session_name]
-
-    if not sessions:
-        print(f"\n❌ No calibration sessions found in {calib_dir}")
-        print("   Please run collect_calibration_data.py first")
-        return 1
-
-    sessions.sort()
-
-    print(f"\nAvailable calibration sessions:")
-    for i, session in enumerate(sessions, 1):
-        session_path = os.path.join(calib_dir, session)
-        # Check if already processed
-        if os.path.exists(os.path.join(session_path, "calibration_result.json")):
-            status = " [PROCESSED]"
-        else:
-            status = ""
-        print(f"  {i}. {session}{status}")
-
-    # Select session
-    if len(sessions) == 1:
-        selected_idx = 0
-        print(f"\n✓ Auto-selected: {sessions[0]}")
-    else:
-        while True:
-            try:
-                choice = input(f"\nSelect session (1-{len(sessions)}) [default: {len(sessions)}]: ").strip()
-                if choice == "":
-                    selected_idx = len(sessions) - 1
-                    break
-                idx = int(choice) - 1
-                if 0 <= idx < len(sessions):
-                    selected_idx = idx
-                    break
-                else:
-                    print(f"Invalid choice. Enter 1-{len(sessions)}")
-            except ValueError:
-                print("Invalid input. Enter a number.")
-
-    session_dir = os.path.join(calib_dir, sessions[selected_idx])
-    print(f"✓ Selected: {sessions[selected_idx]}")
-
-    # Select board type
-    print("\nSelect calibration board type:")
-    print("  1. ChArUco (8x6 grid) - Recommended")
-    print("  2. Chessboard (10x7 corners, 11x8 squares, 22mm)")
-
-    while True:
-        choice = input("\nEnter choice (1 or 2) [default: 1]: ").strip()
-        if choice == "" or choice == "1":
-            board_type = "charuco"
-            break
-        elif choice == "2":
-            board_type = "chessboard"
-            break
-        else:
-            print("Invalid choice. Please enter 1 or 2.")
-
-    print(f"✓ Selected: {board_type}")
-
-    # Select Euler angle order
-    print("\nSelect robot Euler angle order:")
-    print("  1. xyz (intrinsic) - Common for many robots")
-    print("  2. XYZ (extrinsic) - Alternative convention")
-    print("  3. zyx (intrinsic) - Roll-Pitch-Yaw")
-    print("  4. ZYX (extrinsic) - Roll-Pitch-Yaw extrinsic")
-
-    while True:
-        choice = input("\nEnter choice (1-4) [default: 1]: ").strip()
-        if choice == "" or choice == "1":
-            euler_order = "xyz"
-            break
-        elif choice == "2":
-            euler_order = "XYZ"
-            break
-        elif choice == "3":
-            euler_order = "zyx"
-            break
-        elif choice == "4":
-            euler_order = "ZYX"
-            break
-        else:
-            print("Invalid choice. Please enter 1-4.")
-
-    print(f"✓ Selected: {euler_order}")
-
-    input("\nPress ENTER to start calibration computation...")
-
-    # Process calibration
-    try:
-        result = process_calibration(session_dir, board_type, euler_order)
-
+    for method_name, result in results.items():
         if result is None:
-            return 1
+            print(f"{method_name:12s}: Failed")
+        else:
+            error = result['error']
+            print(f"{method_name:12s}: RMS={error['rms_error']:7.2f} mm, "
+                  f"Mean={error['mean_error']:7.2f} mm, Max={error['max_error']:7.2f} mm")
 
-        print("\n" + "="*80)
-        print("✅ Hand-Eye Calibration Complete!")
-        print("="*80)
-        print(f"\nCalibration files saved to:")
-        print(f"  {session_dir}/")
-        print("\nFiles:")
-        print(f"  - calibration_result.json      # Full calibration data")
-        print(f"  - camera_to_tcp_transform.npy  # 4x4 transformation matrix")
-        print(f"  - detected_poses/              # Visualization images")
-        print("\nYou can now use this calibration for:")
-        print("  - Converting camera coordinates to robot base coordinates")
-        print("  - Visual servoing applications")
-        print("  - Object pose estimation in robot frame")
-        print("="*80)
+            if error['rms_error'] < best_error:
+                best_error = error['rms_error']
+                best_result = result
+                best_method = method_name
 
-        return 0
+    # Display best result
+    if best_result is None:
+        print("\nNo successful calibration found!")
+        return
 
-    except Exception as e:
-        print(f"\n❌ Calibration computation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    print(f"\n{'='*60}")
+    print(f"BEST RESULT: {best_method}")
+    print(f"{'='*60}")
+    print(f"RMS Error: {best_error:.2f} mm")
+
+    R_cam2gripper = best_result['R_cam2gripper']
+    t_cam2gripper = best_result['t_cam2gripper']
+
+    euler = rotation_matrix_to_euler_xyz(R_cam2gripper)
+
+    print(f"\nCamera to TCP Transformation:")
+    print(f"\nTranslation (mm):")
+    print(f"  X: {t_cam2gripper[0, 0]:8.2f}")
+    print(f"  Y: {t_cam2gripper[1, 0]:8.2f}")
+    print(f"  Z: {t_cam2gripper[2, 0]:8.2f}")
+
+    print(f"\nRotation (xyz Intrinsic - Rx → Ry → Rz):")
+    print(f"  RX: {euler[0]:8.2f} deg")
+    print(f"  RY: {euler[1]:8.2f} deg")
+    print(f"  RZ: {euler[2]:8.2f} deg")
+
+    print(f"\nRotation Matrix:")
+    print(R_cam2gripper)
+
+    # Additional statistics
+    error = best_result['error']
+    print(f"\n{'='*60}")
+    print("Error Statistics")
+    print(f"{'='*60}")
+    print(f"Mean Error:     {error['mean_error']:8.2f} mm")
+    print(f"Std Deviation:  {error['std_error']:8.2f} mm")
+    print(f"Max Error:      {error['max_error']:8.2f} mm")
+    print(f"RMS Error:      {error['rms_error']:8.2f} mm")
+
+    print(f"\nBoard position in base frame (should be constant):")
+    print(f"  Mean: X={error['mean_position'][0]:8.2f}, "
+          f"Y={error['mean_position'][1]:8.2f}, Z={error['mean_position'][2]:8.2f} mm")
+
+    # Save result
+    output_path = output_dir / "calibration_result.yaml"
+    result_data = {
+        'camera_to_tcp': {
+            'translation_mm': {
+                'x': float(t_cam2gripper[0, 0]),
+                'y': float(t_cam2gripper[1, 0]),
+                'z': float(t_cam2gripper[2, 0])
+            },
+            'rotation_deg': {
+                'rx': float(euler[0]),
+                'ry': float(euler[1]),
+                'rz': float(euler[2])
+            },
+            'rotation_matrix': R_cam2gripper.tolist(),
+            'euler_order': 'xyz',
+            'euler_type': 'intrinsic',
+            'method': best_method,
+            'manual_reference': 'Page 344: Rx → Ry → Rz rotation order'
+        },
+        'calibration_quality': {
+            'rms_error_mm': float(best_error),
+            'mean_error_mm': float(error['mean_error']),
+            'std_error_mm': float(error['std_error']),
+            'max_error_mm': float(error['max_error']),
+            'num_poses': len(data_list)
+        },
+        'board_position_base_frame': {
+            'x_mm': float(error['mean_position'][0]),
+            'y_mm': float(error['mean_position'][1]),
+            'z_mm': float(error['mean_position'][2])
+        }
+    }
+
+    with open(output_path, 'w') as f:
+        yaml.dump(result_data, f, default_flow_style=False)
+
+    print(f"\n{'='*60}")
+    print(f"Results saved to: {output_path}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
-    try:
-        exit_code = main()
-        sys.exit(exit_code)
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Computation interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    main()

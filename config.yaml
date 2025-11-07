@@ -7,7 +7,7 @@ robot:
 
 # Position stability thresholds
 thresholds:
-  position_mm: 0.5 # Maximum position difference in mm
+  position_mm: 0.1 # Maximum position difference in mm
   rotation_deg: 0.1 # Maximum rotation difference in degrees
 
 # Chessboard settings

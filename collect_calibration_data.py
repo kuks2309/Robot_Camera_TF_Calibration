@@ -9,8 +9,26 @@ import numpy as np
 import cv2
 import os
 import yaml
+import time
 from datetime import datetime
 from modbus_robot_interface import ModbusRobotInterface
+
+
+def calculate_tcp_difference(tcp1, tcp2):
+    """Calculate position and rotation difference between two TCP poses"""
+    if tcp1 is None or tcp2 is None:
+        return None, None
+
+    x1, y1, z1, rx1, ry1, rz1 = tcp1
+    x2, y2, z2, rx2, ry2, rz2 = tcp2
+
+    # Position difference (Euclidean distance in mm)
+    position_diff = np.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
+
+    # Rotation difference (max absolute difference in degrees)
+    rotation_diff = max(abs(rx2-rx1), abs(ry2-ry1), abs(rz2-rz1))
+
+    return position_diff, rotation_diff
 
 
 def main():
@@ -25,7 +43,13 @@ def main():
     images_dir = config['storage']['images_dir']
     data_file = config['storage']['data_file']
 
+    # Load thresholds
+    position_threshold = config['thresholds']['position_mm']
+    rotation_threshold = config['thresholds']['rotation_deg']
+
     print(f"Config loaded: Robot={robot_ip}:{robot_port}")
+    print(f"Position threshold: {position_threshold} mm")
+    print(f"Rotation threshold: {rotation_threshold} deg")
 
     # Create pipeline
     pipeline = rs.pipeline()
@@ -127,20 +151,54 @@ def main():
         elif key == ord(' '):  # SPACE - capture
             print(f"\n[Capture {capture_count + 1}]")
 
-            # Get TCP pose if robot connected
-            tcp = None
+            # Step 1: Read TCP pose BEFORE image capture
+            tcp_before = None
             if robot_connected:
-                tcp = robot.read_camera_pose()
-                if tcp:
-                    x, y, z, rx, ry, rz = tcp
-                    print(f"TCP: x={x:.1f}, y={y:.1f}, z={z:.1f}, rx={rx:.2f}, ry={ry:.2f}, rz={rz:.2f}")
+                tcp_before = robot.read_camera_pose()
+                if tcp_before:
+                    x, y, z, rx, ry, rz = tcp_before
+                    print(f"TCP Before: x={x:.1f}, y={y:.1f}, z={z:.1f}, rx={rx:.2f}, ry={ry:.2f}, rz={rz:.2f}")
                 else:
-                    print("⚠️  Failed to read TCP")
+                    print("⚠️  Failed to read TCP before capture")
 
-            # Save image (full resolution, not resized)
+            # Step 2: Capture image
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
-            # Create base filename (without extension)
+            # Small delay to ensure image is captured
+            time.sleep(0.05)
+
+            # Step 3: Read TCP pose AFTER image capture
+            tcp_after = None
+            if robot_connected:
+                tcp_after = robot.read_camera_pose()
+                if tcp_after:
+                    x, y, z, rx, ry, rz = tcp_after
+                    print(f"TCP After:  x={x:.1f}, y={y:.1f}, z={z:.1f}, rx={rx:.2f}, ry={ry:.2f}, rz={rz:.2f}")
+                else:
+                    print("⚠️  Failed to read TCP after capture")
+
+            # Step 4: Check TCP stability
+            if tcp_before is not None and tcp_after is not None:
+                position_diff, rotation_diff = calculate_tcp_difference(tcp_before, tcp_after)
+
+                print(f"TCP Stability Check:")
+                print(f"  Position difference: {position_diff:.3f} mm (threshold: {position_threshold} mm)")
+                print(f"  Rotation difference: {rotation_diff:.3f} deg (threshold: {rotation_threshold} deg)")
+
+                if position_diff > position_threshold or rotation_diff > rotation_threshold:
+                    print("❌ TCP UNSTABLE - Robot moved during capture!")
+                    print("   Capture rejected. Please wait for robot to stabilize and try again.")
+                    continue  # Skip saving this capture
+
+                print("✅ TCP stable - proceeding with save")
+                # Use average of before and after TCP as the final value
+                tcp = tuple((b + a) / 2.0 for b, a in zip(tcp_before, tcp_after))
+            elif tcp_before is not None:
+                tcp = tcp_before  # Fallback to before if after failed
+            else:
+                tcp = None
+
+            # Step 5: Save image and data (only if TCP check passed)
             base_filename = f"image_{capture_count + 1:03d}"
             img_filename = os.path.join(images_dir, f"{base_filename}.jpg")
             yaml_filename = os.path.join(images_dir, f"{base_filename}.yaml")
@@ -166,6 +224,14 @@ def main():
                     'ry_deg': float(ry),
                     'rz_deg': float(rz)
                 }
+
+                # Add stability info
+                if tcp_before is not None and tcp_after is not None:
+                    pose_data['stability'] = {
+                        'position_diff_mm': float(position_diff),
+                        'rotation_diff_deg': float(rotation_diff),
+                        'stable': True
+                    }
 
             # Save individual YAML file for this image
             with open(yaml_filename, 'w') as f:
